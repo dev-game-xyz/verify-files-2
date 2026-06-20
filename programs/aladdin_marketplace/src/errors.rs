@@ -39,4 +39,7 @@ pub enum MarketError {
 
     #[msg("The new owner address is invalid (must not be the system program / zero).")]
     InvalidNewOwner,
+
+    #[msg("Only the recorded buyer may claim this item.")]
+    NotBuyer,
 }

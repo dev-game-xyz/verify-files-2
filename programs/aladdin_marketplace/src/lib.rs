@@ -78,8 +78,10 @@ pub mod aladdin_marketplace {
     }
 
     // -----------------------------------------------------------------------
-    // 🏷 sell(spl_token_addr) — owner only. Creates a listing and ESCROWS one
-    // token unit into the listing's PDA-owned vault.
+    // 🏷 sell(spl_token_addr) — PERMISSIONLESS. Any holder of an ALLOWED item
+    // may create a listing and ESCROW one token unit into the listing's
+    // PDA-owned vault. The player pays rent + fees and is the SOLE signer
+    // (no owner co-sign), so Phantom can simulate it cleanly.
     //   • verifies the mint is on the allowed list (the `allowed_item` PDA must
     //     exist with the matching seed — Anchor fails to load it otherwise)
     //   • transfers the token from the seller's account to the listing vault
@@ -201,42 +203,43 @@ pub mod aladdin_marketplace {
     }
 
     // -----------------------------------------------------------------------
-    // 🛒 buy(listing_id, new_owner) — OWNER ONLY.
+    // 🛒 buy(listing_id, new_owner) — OWNER ONLY (settlement).
     //
     // The off-chain flow: a buyer pays gold to the seller through the game's
     // centralised DB; once the server has confirmed payment, the game wallet
-    // (owner) calls `buy` to release the escrowed token to `new_owner`.
+    // (owner) calls `buy`. Instead of pushing the token to the buyer (which
+    // would make the OWNER pay the buyer's ATA rent + gas), we MOVE the token
+    // into a CLAIMABLE vault owned by a new `["claimable", listing_id]` PDA and
+    // record the buyer. The buyer later pulls it themselves via `claim`, paying
+    // their own ATA rent + gas + the claim fee — so the owner never pays gas to
+    // deliver items.
     //
     // Anchor enforces owner-only via `has_one = owner` + Signer, so no buyer can
-    // ever pull the token themselves — only the trusted game wallet can settle.
+    // settle a sale themselves — only the trusted game wallet can.
     // -----------------------------------------------------------------------
     pub fn buy(ctx: Context<Buy>, _listing_id: String, new_owner: Pubkey) -> Result<()> {
-        // The destination token account must be owned by `new_owner` and hold
-        // the right mint — so the token can only land with the intended buyer.
-        require_keys_eq!(
-            ctx.accounts.buyer_token.owner,
-            new_owner,
-            MarketError::NewOwnerMismatch
-        );
-        require_keys_eq!(
-            ctx.accounts.buyer_token.mint,
-            ctx.accounts.listing.spl_token_addr,
-            MarketError::MintMismatch
-        );
-
         // 📸 snapshot the listing details NOW — the listing account is closed at
         // the end of this instruction (`close = owner`), so we record the trade
-        // from these locals.
+        // and the claimable from these locals.
         let listing_id = ctx.accounts.listing.listing_id.clone();
         let mint = ctx.accounts.listing.spl_token_addr;
         let seller = ctx.accounts.listing.owner;
         let price = ctx.accounts.listing.price;
         let listing_bump = ctx.accounts.listing.bump;
 
+        // sanity: the claimable vault must hold the same mint as the listing.
+        require_keys_eq!(
+            ctx.accounts.claimable_vault.mint,
+            mint,
+            MarketError::MintMismatch
+        );
+
+        // Move the escrowed token: listing vault -> CLAIMABLE vault (still
+        // PDA-custodied — the buyer can't touch it until they `claim`).
         transfer_from_vault(
             &ctx.accounts.token_program,
             &ctx.accounts.listing_vault,
-            &ctx.accounts.buyer_token,
+            &ctx.accounts.claimable_vault,
             &ctx.accounts.listing.to_account_info(),
             &listing_id,
             listing_bump,
@@ -246,11 +249,18 @@ pub mod aladdin_marketplace {
         close_vault(
             &ctx.accounts.token_program,
             &ctx.accounts.listing_vault,
-            &ctx.accounts.owner_refund, // rent refunded to the owner
+            &ctx.accounts.owner_refund, // listing-vault rent refunded to the owner
             &ctx.accounts.listing.to_account_info(),
             &listing_id,
             listing_bump,
         )?;
+
+        // 📦 record the CLAIMABLE item — only `new_owner` may claim it later.
+        let claimable = &mut ctx.accounts.claimable;
+        claimable.spl_token_addr = mint;
+        claimable.buyer = new_owner;
+        claimable.listing_id = listing_id.clone();
+        claimable.bump = ctx.bumps.claimable;
 
         // 🧾 LOG THE TRADE — bump the global counter and write the permanent
         // on-chain trade record (id / listing_id / mint / seller / buyer / price).
@@ -266,7 +276,7 @@ pub mod aladdin_marketplace {
         trade.bump = ctx.bumps.trade;
 
         msg!(
-            "sold · id={} mint={} seller={} buyer={} price={} (trade #{})",
+            "sold (claimable) · id={} mint={} seller={} buyer={} price={} (trade #{})",
             listing_id,
             mint,
             seller,
@@ -275,6 +285,96 @@ pub mod aladdin_marketplace {
             trade.id
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // 📦 claim(listing_id) — BUYER ONLY. The recorded buyer pulls their bought
+    // item from the claimable vault into their OWN token account. The buyer is
+    // the SOLE signer, fee payer, and rent payer:
+    //   • pays the claim fee (marketplace.username_fee lamports, 0.01 SOL) to
+    //     the owner via an explicit System transfer (buyer → owner),
+    //   • receives the token into `buyer_token` (their own ATA — they pay its
+    //     rent if it must be created in the same tx, client-side),
+    //   • closes the claimable vault + ClaimableItem PDA, rent refunded to them.
+    // Single-signer ⇒ Phantom simulates it cleanly (no malicious-dApp warning).
+    // -----------------------------------------------------------------------
+    pub fn claim(ctx: Context<Claim>, listing_id: String) -> Result<()> {
+        // Only the recorded buyer may claim.
+        require_keys_eq!(
+            ctx.accounts.buyer.key(),
+            ctx.accounts.claimable.buyer,
+            MarketError::NotBuyer
+        );
+        // The destination token account must be the buyer's and the right mint.
+        require_keys_eq!(
+            ctx.accounts.buyer_token.owner,
+            ctx.accounts.buyer.key(),
+            MarketError::NewOwnerMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.buyer_token.mint,
+            ctx.accounts.claimable.spl_token_addr,
+            MarketError::MintMismatch
+        );
+
+        let fee = ctx.accounts.marketplace.username_fee;
+        let claimable_bump = ctx.accounts.claimable.bump;
+
+        // 💰 pay the claim fee to the owner (buyer → owner) via System transfer
+        // (explicit + simulatable — Phantom shows "you send X SOL to <owner>").
+        if fee > 0 {
+            let ix = anchor_lang::solana_program::system_instruction::transfer(
+                &ctx.accounts.buyer.key(),
+                &ctx.accounts.owner.key(),
+                fee,
+            );
+            anchor_lang::solana_program::program::invoke(
+                &ix,
+                &[
+                    ctx.accounts.buyer.to_account_info(),
+                    ctx.accounts.owner.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Release the token: claimable vault -> buyer's own token account,
+        // signed by the claimable PDA.
+        let seeds: &[&[u8]] = &[b"claimable", listing_id.as_bytes(), &[claimable_bump]];
+        let signer: &[&[&[u8]]] = &[seeds];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.claimable_vault.to_account_info(),
+                    to: ctx.accounts.buyer_token.to_account_info(),
+                    authority: ctx.accounts.claimable.to_account_info(),
+                },
+                signer,
+            ),
+            LISTING_AMOUNT,
+        )?;
+
+        // Close the now-empty claimable vault, refunding its rent to the buyer.
+        token::close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.claimable_vault.to_account_info(),
+                destination: ctx.accounts.buyer.to_account_info(),
+                authority: ctx.accounts.claimable.to_account_info(),
+            },
+            signer,
+        ))?;
+
+        msg!(
+            "claimed · id={} mint={} buyer={}",
+            listing_id,
+            ctx.accounts.claimable.spl_token_addr,
+            ctx.accounts.buyer.key()
+        );
+        Ok(())
+        // The ClaimableItem PDA itself is closed via `close = buyer` in the
+        // accounts struct (rent → buyer).
     }
 
     // -----------------------------------------------------------------------
@@ -464,12 +564,12 @@ pub struct AddAllowedItem<'info> {
 #[derive(Accounts)]
 #[instruction(listing_id: String)]
 pub struct Sell<'info> {
-    #[account(mut, seeds = [b"marketplace"], bump = marketplace.bump, has_one = owner @ MarketError::NotOwner)]
+    // No `has_one = owner` — listing is PERMISSIONLESS. Anyone holding an
+    // ALLOWED item (proven by the `allowed_item` PDA below) may list it. The
+    // owner does NOT sign, so `sell` is a SINGLE-SIGNER transaction (the
+    // player), which lets Phantom simulate it cleanly (no "malicious" warning).
+    #[account(mut, seeds = [b"marketplace"], bump = marketplace.bump)]
     pub marketplace: Account<'info, Marketplace>,
-
-    /// The owner (game wallet) — the only authority allowed to create listings.
-    #[account(mut)]
-    pub owner: Signer<'info>,
 
     pub mint: Account<'info, Mint>,
 
@@ -478,9 +578,10 @@ pub struct Sell<'info> {
     pub allowed_item: Account<'info, AllowedItem>,
 
     /// The new listing PDA. The id is the seed → unique + alphanumeric.
+    /// The PLAYER (`seller_authority`) pays rent — they list their own item.
     #[account(
         init,
-        payer = owner,
+        payer = seller_authority,
         space = 8 + Listing::INIT_SPACE,
         seeds = [b"listing", listing_id.as_bytes()],
         bump
@@ -488,9 +589,10 @@ pub struct Sell<'info> {
     pub listing: Account<'info, Listing>,
 
     /// The PDA-owned escrow vault (an ATA owned by the listing PDA).
+    /// The PLAYER pays the ATA rent too.
     #[account(
         init,
-        payer = owner,
+        payer = seller_authority,
         associated_token::mint = mint,
         associated_token::authority = listing
     )]
@@ -500,7 +602,9 @@ pub struct Sell<'info> {
     #[account(mut, constraint = seller_token.mint == mint.key() @ MarketError::MintMismatch)]
     pub seller_token: Account<'info, TokenAccount>,
 
-    /// Whoever currently controls `seller_token` and signs the escrow move.
+    /// The player: controls `seller_token`, signs the escrow move, pays rent,
+    /// AND is the fee payer. The ONLY signer on this instruction.
+    #[account(mut)]
     pub seller_authority: Signer<'info>,
 
     pub token_program: Program<'info, Token>,
@@ -552,6 +656,10 @@ pub struct Buy<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
 
+    /// The mint being sold (needed to init the claimable vault ATA).
+    #[account(address = listing.spl_token_addr @ MarketError::MintMismatch)]
+    pub mint: Account<'info, Mint>,
+
     #[account(
         mut,
         close = owner,
@@ -567,9 +675,25 @@ pub struct Buy<'info> {
     )]
     pub listing_vault: Account<'info, TokenAccount>,
 
-    /// The buyer's token account — must be owned by `new_owner`.
-    #[account(mut)]
-    pub buyer_token: Account<'info, TokenAccount>,
+    /// 📦 the CLAIMABLE record — created here, closed when the buyer claims.
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + ClaimableItem::INIT_SPACE,
+        seeds = [b"claimable", listing_id.as_bytes()],
+        bump
+    )]
+    pub claimable: Account<'info, ClaimableItem>,
+
+    /// The claimable escrow vault — an ATA owned by the claimable PDA. Holds the
+    /// token between settlement and the buyer's claim.
+    #[account(
+        init,
+        payer = owner,
+        associated_token::mint = mint,
+        associated_token::authority = claimable
+    )]
+    pub claimable_vault: Account<'info, TokenAccount>,
 
     /// 🧾 the permanent on-chain trade record, keyed by the (unique) listing id.
     #[account(
@@ -581,11 +705,56 @@ pub struct Buy<'info> {
     )]
     pub trade: Account<'info, Trade>,
 
-    /// CHECK: receives the vault's reclaimed rent (the owner/caller).
+    /// CHECK: receives the listing vault's reclaimed rent (the owner/caller).
     #[account(mut)]
     pub owner_refund: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(listing_id: String)]
+pub struct Claim<'info> {
+    /// `has_one = owner` ties `owner` to the stored owner so the claim fee can
+    /// only ever be paid to the real marketplace owner.
+    #[account(seeds = [b"marketplace"], bump = marketplace.bump, has_one = owner @ MarketError::NotOwner)]
+    pub marketplace: Account<'info, Marketplace>,
+
+    /// THE BUYER — the SOLE signer, fee payer, and rent payer.
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    /// CHECK: the marketplace owner — receives the claim fee. Verified by the
+    /// `has_one = owner` constraint above; mut because it receives lamports.
+    #[account(mut)]
+    pub owner: UncheckedAccount<'info>,
+
+    /// The claimable record — must belong to `buyer`; closed (rent → buyer) here.
+    #[account(
+        mut,
+        close = buyer,
+        seeds = [b"claimable", listing_id.as_bytes()],
+        bump = claimable.bump
+    )]
+    pub claimable: Account<'info, ClaimableItem>,
+
+    /// The claimable escrow vault the token is released FROM.
+    #[account(
+        mut,
+        associated_token::mint = claimable.spl_token_addr,
+        associated_token::authority = claimable
+    )]
+    pub claimable_vault: Account<'info, TokenAccount>,
+
+    /// The buyer's own token account — receives the claimed item. The client
+    /// creates it idempotently in the same tx (buyer pays its rent).
+    #[account(mut)]
+    pub buyer_token: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 

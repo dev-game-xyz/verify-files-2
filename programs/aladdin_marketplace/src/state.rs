@@ -84,7 +84,27 @@ pub struct Trade {
     pub bump: u8,
 }
 
-/// 👤 USERNAME REGISTRY — one PDA per username (seed `["username", username]`).
+/// � CLAIMABLE ITEMS — one PDA per SOLD-but-unclaimed item
+/// (seed `["claimable", listing_id]`). When the owner settles a `buy`, the
+/// escrowed token is moved into THIS PDA's vault and a ClaimableItem record is
+/// written. Only the recorded `buyer` may later `claim` it — they pay the
+/// claim fee + their own ATA rent + gas, so the OWNER never pays gas to
+/// deliver items (the buyer pulls it themselves).
+#[account]
+#[derive(InitSpace)]
+pub struct ClaimableItem {
+    /// The SPL token mint waiting to be claimed.
+    pub spl_token_addr: Pubkey,
+    /// The wallet allowed to claim it (the buyer the owner settled the sale to).
+    pub buyer: Pubkey,
+    /// The originating listing id (also the PDA seed).
+    #[max_len(MAX_ID_LEN)]
+    pub listing_id: String,
+    /// PDA bump for `["claimable", listing_id]`.
+    pub bump: u8,
+}
+
+/// �👤 USERNAME REGISTRY — one PDA per username (seed `["username", username]`).
 /// Maps a unique alphanumeric username to a wallet address. Permanent: once
 /// written it can never be changed or reassigned (the PDA can't be re-init'd).
 #[account]
