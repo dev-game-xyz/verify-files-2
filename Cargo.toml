@@ -1,0 +1,20 @@
+# Cargo workspace for the Anchor program. The actual program crate lives in
+# programs/aladdin_marketplace.
+[workspace]
+members = ["programs/*"]
+resolver = "2"
+
+# Pin the Solana toolchain so `solana-verify` (and OtterSec's worker) pick the
+# matching build image deterministically. Must equal the locked solana-program.
+[workspace.metadata.cli]
+solana = "2.3.0"
+
+[profile.release]
+overflow-checks = true   # 🔐 abort on integer overflow even in release builds
+lto = "fat"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

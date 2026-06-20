@@ -1,0 +1,18 @@
+# Rust / Anchor build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Solana keypairs / secrets — NEVER commit these
+*-keypair.json
+id.json
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor cruft
+.DS_Store
+node_modules
+.idea
+.vscode

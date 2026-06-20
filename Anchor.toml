@@ -1,0 +1,27 @@
+# ⚓ Anchor workspace for the Aladdin-Jin on-chain marketplace + username registry.
+# Run all commands from this directory (programs/marketplace).
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+aladdin_marketplace = "9HRyqHTN65Rz5EhX1PGRzaVKAcNNMx3NFd62yfLxiUvp"
+
+[programs.mainnet]
+aladdin_marketplace = "9HRyqHTN65Rz5EhX1PGRzaVKAcNNMx3NFd62yfLxiUvp"
+
+[programs.devnet]
+aladdin_marketplace = "9HRyqHTN65Rz5EhX1PGRzaVKAcNNMx3NFd62yfLxiUvp"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
