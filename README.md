@@ -64,7 +64,7 @@ solana-verify get-program-hash 9HRyqHTN65Rz5EhX1PGRzaVKAcNNMx3NFd62yfLxiUvp \
 solana-verify verify-from-repo \
   --program-id 9HRyqHTN65Rz5EhX1PGRzaVKAcNNMx3NFd62yfLxiUvp \
   -u https://api.mainnet-beta.solana.com \
-  https://github.com/dev-game-xyz/marketplace-verify
+  https://github.com/dev-game-xyz/verify-files-2
 
 # 6. Trigger the OtterSec remote job (gets the public Solscan "verified" badge)
 solana-verify remote submit-job \
